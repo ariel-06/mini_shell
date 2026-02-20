@@ -1,0 +1,27 @@
+Shell version 1.4 created December 2024
+
+f1is5lines
+f2is3lines
+f3is7lines
+f1is5lines
+f1is5lines
+f2is3lines
+f3is7lines
+f3is7lines
+f1is5lines
+f3is7lines
+f3is7lines
+f3is7lines
+f1is5lines
+f2is3lines
+f3is7lines
+f1is5lines
+f1is5lines
+f2is3lines
+f3is7lines
+f3is7lines
+f1is5lines
+f3is7lines
+f3is7lines
+f3is7lines
+Bye!

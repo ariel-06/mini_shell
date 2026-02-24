@@ -1,7 +1,15 @@
+#ifdef DEBUG
+#   define debug(...) fprintf(stderr, __VA_ARGS__)
+#else
+#   define debug(...)
+#   define NDEBUG
+#endif
+
+#include <assert.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdio.h>
-
+#include <pthread.h>
 #include "shellmemory.h"
 #include "interpreter.h"
 #include "shell.h"
@@ -15,7 +23,7 @@ struct memory_struct {
 int avail_file_numbers[3] = {1, 1, 1};
 
 struct memory_struct shellmemory[MEM_SIZE];
-
+char current_policy[16];     // stores active scheduling policy
 
 //new types to store script based on assumptions in 1.2.1
 typedef struct line {
@@ -27,25 +35,21 @@ typedef struct line {
     int owner;
 } Line; 
 
-typedef struct pcb{
-    int PID;
-    int start_index;
-    int length;
-    int program_counter;
-    struct pcb *next;
-    struct pcb *prev;
-    int job_length_score;
-    int priority;
-} PCB;
-
-typedef struct queue { 
-    PCB *head;
-    PCB *tail;
-} Queue;
 
 Line script_memory[1000];
 Queue q = {NULL, NULL};
 
+//Multi threading variables
+pthread_t workers[2];
+pthread_mutex_t queue_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t queue_cond = PTHREAD_COND_INITIALIZER;
+pthread_mutex_t active_jobs_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t active_jobs_cond = PTHREAD_COND_INITIALIZER;
+pthread_mutex_t shellmem_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+int mt_enabled = 0;          // becomes 1 when MT is activated
+int scheduler_running = 0;   // controls worker loop
+int active_jobs = 0;         // number of active scripts being processed
 
 
 
@@ -74,32 +78,56 @@ void mem_init() {
 
 }
 
-void enqueue(PCB *node){
-    if (q.head == NULL)
+void enqueue(PCB *node) {
+    node->next = NULL;
+    node->prev = NULL;
+
+    pthread_mutex_lock(&queue_mutex);
+    if (q.head == NULL) {
         q.head = node;
-    else {
+        q.tail = node;
+    } else {
         q.tail->next = node;
         node->prev = q.tail;
+        q.tail = node;
     }
-    q.tail = node;
-
+    pthread_cond_signal(&queue_cond);
+    pthread_mutex_unlock(&queue_mutex);
 }
 
-PCB* dequeue(){ 
-    //removes the first node in the queue and returns it
+PCB* dequeue() {
+    pthread_mutex_lock(&queue_mutex);
     PCB *node = q.head;
-    if (node == NULL){
-        return NULL; //do nothing bc the queue is already empty
-    } else if (node == q.tail){
+    if (node == NULL) {
+        pthread_mutex_unlock(&queue_mutex);
+        return NULL;
+    }
+    if (node == q.tail) {
         q.head = NULL;
         q.tail = NULL;
     } else {
-        q.head = q.head->next;
+        q.head = node->next;
         q.head->prev = NULL;
     }
-
     node->next = NULL;
-    node->prev = NULL; 
+    node->prev = NULL;
+    pthread_mutex_unlock(&queue_mutex);
+    return node;
+}
+
+// dequeue_unlocked: caller MUST already hold queue_mutex
+static PCB* dequeue_unlocked() {
+    PCB *node = q.head;
+    if (node == NULL) return NULL;
+    if (node == q.tail) {
+        q.head = NULL;
+        q.tail = NULL;
+    } else {
+        q.head = node->next;
+        q.head->prev = NULL;
+    }
+    node->next = NULL;
+    node->prev = NULL;
     return node;
 }
 
@@ -166,8 +194,16 @@ int add_script (FILE *file){
     pcb->length = i - start;
     pcb->job_length_score = pcb->length;
 
+    // enqueue first (locks queue_mutex internally), then bump active_jobs
+    // FIX #1: consistent lock order — queue_mutex then active_jobs_mutex,
+    //         never the reverse. Here they are separate, non-nested calls.
     //add the new process to end of the ready queue
     enqueue(pcb);
+
+    // Increment active jobs when adding a PCB
+    pthread_mutex_lock(&active_jobs_mutex);
+    active_jobs++;
+    pthread_mutex_unlock(&active_jobs_mutex);
 
     return pcb->PID;
 
@@ -312,7 +348,11 @@ void run_queue_sjf_aging(){
     }
 }
 
+// FIX #3: clean_script is now thread-safe — holds queue_mutex while touching the queue
 void clean_script(int pid){
+    // Clean script_memory (no lock needed — only touched while queue_mutex held
+    // in worker, or single-threaded otherwise; adding queue_mutex here is safest)
+    pthread_mutex_lock(&queue_mutex);
     PCB *current = q.head;
 
     for (int i = 0; i < 1000; i++){
@@ -343,40 +383,131 @@ void clean_script(int pid){
     }
 
     avail_file_numbers[pid - 1] = 1;
+    pthread_mutex_unlock(&queue_mutex);
 }
 
 
 // Set key value pair
 void mem_set_value(char *var_in, char *value_in) {
-    int i;
-
-    for (i = 0; i < MEM_SIZE; i++) {
+    // FIX #5: protect shell memory with its own mutex
+    pthread_mutex_lock(&shellmem_mutex);
+    for (int i = 0; i < MEM_SIZE; i++) {
         if (strcmp(shellmemory[i].var, var_in) == 0) {
+            free(shellmemory[i].value);
             shellmemory[i].value = strdup(value_in);
+            pthread_mutex_unlock(&shellmem_mutex);
             return;
         }
     }
-
-    //Value does not exist, need to find a free spot.
-    for (i = 0; i < MEM_SIZE; i++) {
+    for (int i = 0; i < MEM_SIZE; i++) {
         if (strcmp(shellmemory[i].var, "none") == 0) {
-            shellmemory[i].var = strdup(var_in);
+            shellmemory[i].var   = strdup(var_in);
             shellmemory[i].value = strdup(value_in);
+            pthread_mutex_unlock(&shellmem_mutex);
             return;
         }
     }
-
-    return;
+    pthread_mutex_unlock(&shellmem_mutex);
 }
 
 //get value based on input key
 char *mem_get_value(char *var_in) {
-    int i;
-
-    for (i = 0; i < MEM_SIZE; i++) {
+    // FIX #5: protect shell memory with its own mutex
+    pthread_mutex_lock(&shellmem_mutex);
+    for (int i = 0; i < MEM_SIZE; i++) {
         if (strcmp(shellmemory[i].var, var_in) == 0) {
-            return strdup(shellmemory[i].value);
+            char *val = strdup(shellmemory[i].value);
+            pthread_mutex_unlock(&shellmem_mutex);
+            return val;
         }
     }
+    pthread_mutex_unlock(&shellmem_mutex);
     return NULL;
+}
+
+void *worker_function(void *arg) {
+    while (1) {
+        pthread_mutex_lock(&queue_mutex);
+
+        // Wait for work or shutdown signal
+        while (q.head == NULL && scheduler_running)
+            pthread_cond_wait(&queue_cond, &queue_mutex);
+
+        if (!scheduler_running && q.head == NULL) {
+            pthread_mutex_unlock(&queue_mutex);
+            break;
+        }
+
+        PCB *pcb = dequeue_unlocked();
+        pthread_mutex_unlock(&queue_mutex);
+
+        if (pcb == NULL) continue;
+
+        // ---- FCFS / SJF: run entire job ----
+        if (strcmp(current_policy, "FCFS") == 0 || strcmp(current_policy, "SJF") == 0) {
+            while (pcb->program_counter < pcb->length) {
+                parseInput(script_memory[pcb->start_index + pcb->program_counter].content);
+                pcb->program_counter++;
+            }
+            int pid = pcb->PID;
+            clean_script(pid); // FIX #3: now thread-safe
+
+            // FIX #1: active_jobs_mutex acquired AFTER queue_mutex is released (clean_script released it)
+            pthread_mutex_lock(&active_jobs_mutex);
+            active_jobs--;
+            pthread_cond_signal(&active_jobs_cond);
+            pthread_mutex_unlock(&active_jobs_mutex);
+        }
+
+        // ---- RR / RR30: one time slice ----
+        else if (strcmp(current_policy, "RR") == 0 || strcmp(current_policy, "RR30") == 0) {
+            int slice = (strcmp(current_policy, "RR30") == 0) ? 30 : 2;
+            int time  = 0;
+            while (pcb->program_counter < pcb->length && time < slice) {
+                parseInput(script_memory[pcb->start_index + pcb->program_counter].content);
+                pcb->program_counter++;
+                time++;
+            }
+
+            if (pcb->program_counter < pcb->length) {
+                enqueue(pcb); // re-queue for next slice (enqueue locks internally)
+            } else {
+                int pid = pcb->PID;
+                clean_script(pid); // FIX #3: thread-safe
+
+                pthread_mutex_lock(&active_jobs_mutex);
+                active_jobs--;
+                pthread_cond_signal(&active_jobs_cond);
+                pthread_mutex_unlock(&active_jobs_mutex);
+            }
+        }
+    }
+
+    return NULL;
+}
+
+void start_scheduler_threads(char *policy) {
+    // FIX #4: always update the policy, even if threads are already running
+    strncpy(current_policy, policy, sizeof(current_policy) - 1);
+    current_policy[sizeof(current_policy) - 1] = '\0';
+
+    if (scheduler_running)
+        return; // threads already alive, policy updated above — done
+
+    scheduler_running = 1;
+    pthread_create(&workers[0], NULL, worker_function, NULL);
+    pthread_create(&workers[1], NULL, worker_function, NULL);
+}
+
+void stop_scheduler_threads() {
+    if (!scheduler_running)
+        return;
+
+    pthread_mutex_lock(&queue_mutex);
+    scheduler_running = 0;
+    pthread_cond_broadcast(&queue_cond);
+    pthread_mutex_unlock(&queue_mutex);
+
+    pthread_join(workers[0], NULL);
+    pthread_join(workers[1], NULL);
 }

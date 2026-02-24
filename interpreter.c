@@ -61,39 +61,58 @@ int exec(int count, ...);
 int badcommandFileDoesNotExist();
 
 //Helper function which reads the rest of the 
-FILE* get_batch_input(){
+FILE *get_batch_input(char **out_buffer) {
     char line[1000];
     size_t total_size = 0;
-    size_t capacity = 1024;
+    size_t capacity   = 1024;
 
-    char* buffer = malloc(capacity);
-    if(!buffer){
-        return NULL;
-    }
+    char *buffer = malloc(capacity);
+    if (!buffer) return NULL;
     buffer[0] = '\0';
-    //reading the rest of stdin until EOF
-    while (fgets(line, sizeof(line), stdin) != NULL){
-        size_t len = strlen(line);
 
-        //Resize buffer if full
-        if (total_size + len + 1 > capacity){
-            capacity = capacity * 2;
-            char *new_buffer = realloc(buffer, capacity);
-            if (!new_buffer){
-                free(buffer);
-                return NULL;
-            }
-            buffer = new_buffer;
+    while (fgets(line, sizeof(line), stdin) != NULL) {
+        size_t len = strlen(line);
+        if (total_size + len + 1 > capacity) {
+            capacity *= 2;
+            char *nb = realloc(buffer, capacity);
+            if (!nb) { free(buffer); return NULL; }
+            buffer = nb;
         }
         strcat(buffer, line);
-        total_size = total_size + len;
+        total_size += len;
     }
-    if (total_size == 0){
-        free(buffer);
-        return NULL;
-    }
+
+    if (total_size == 0) { free(buffer); return NULL; }
+
     FILE *f = fmemopen(buffer, total_size, "r");
+    if (!f) { free(buffer); return NULL; }
+
+    // FIX #7: give ownership of buffer back to caller so they can free it after fclose
+    *out_buffer = buffer;
     return f;
+}
+
+//Helper function which runs the MT execution
+int multithread_execution(char *mode) {
+    // FIX #4: start_scheduler_threads always updates policy now;
+    //         if threads are already alive they keep running with the new policy.
+    start_scheduler_threads(mode);
+
+    // Wake any threads that may be waiting (in case queue was populated
+    // before threads were started the very first time).
+    pthread_mutex_lock(&queue_mutex);
+    pthread_cond_broadcast(&queue_cond);
+    pthread_mutex_unlock(&queue_mutex);
+
+    // Wait until every job that was enqueued for this exec call finishes.
+    // This is safe: workers signal active_jobs_cond while holding active_jobs_mutex,
+    // so we cannot miss a signal here.
+    pthread_mutex_lock(&active_jobs_mutex);
+    while (active_jobs > 0)
+        pthread_cond_wait(&active_jobs_cond, &active_jobs_mutex);
+    pthread_mutex_unlock(&active_jobs_mutex);
+
+    return 0;
 }
 
 
@@ -186,26 +205,26 @@ int interpreter(char *command_args[], int args_size) {
         }
 
         int background = 0;     //Flag to check if the background execution (#) was called
-        char *policy = NULL;
-        int num_programs = 0;
+        int last_index = args_size - 1;
         
-        //Background execution is called
-        if (strcmp(command_args[args_size - 1], "#") == 0) {
-            background = 1;
-            policy = command_args[args_size - 2];
-            num_programs = args_size - 3;
-        } 
-        else {
-            background = 0;
-            policy = command_args[args_size - 1];
-            num_programs = args_size - 2;
+        // Detect MT
+        if (strcmp(command_args[last_index], "MT") == 0) {
+            mt_enabled = 1;     // stays enabled forever
+            last_index--;
         }
+        // Detect #
+        if (strcmp(command_args[last_index], "#") == 0) {
+            background = 1;
+            last_index--;
+        }
+        // Extract policy
+        char *policy = command_args[last_index];
+        int num_programs = last_index - 1;
 
         if (num_programs < 1) {
             fprintf(stderr, "error: no program specified\n");
             return badcommand();
         }
-
         // Checking for duplicates
         for (int i = 1; i <= num_programs; i++) {
             for (int j = i + 1; j <= num_programs; j++) {
@@ -217,39 +236,26 @@ int interpreter(char *command_args[], int args_size) {
         }
         
         //Building the call to exec()
-        int total_args = num_programs + 1 + background;     // +1 for the policy
-        //Only total_args with 1 program and 1 policy
-        if (total_args == 2) {
+        if (num_programs == 1 && !background)
             return exec(2, command_args[1], policy);
-        }
-        else if (total_args == 3){
-            // 2 programs and 1 policy
-            if (num_programs == 2){
-                    return exec(3, command_args[1], command_args[2], policy);
-            }
-            // 1 program, 1 policy and background
-            else{
-                return exec(3, command_args[1], policy, "#");
-            }
-        }
-        else if (total_args == 4){
-            // 3 programs and 1 policy
-            if (num_programs == 3){
-                return exec(4, command_args[1], command_args[2], command_args[3], policy);
-            }
-            // 2 programs, 1 policy and background
-            else{
-                return exec(4, command_args[1], command_args[2], policy, "#");
-            }
-        }
-        else if (total_args == 5){
-            // 3 programs, 1 policy and background
+
+        if (num_programs == 1 && background)
+            return exec(3, command_args[1], policy, "#");
+
+        if (num_programs == 2 && !background)
+            return exec(3, command_args[1], command_args[2], policy);
+
+        if (num_programs == 2 && background)
+            return exec(4, command_args[1], command_args[2], policy, "#");
+
+        if (num_programs == 3 && !background)
+            return exec(4, command_args[1], command_args[2], command_args[3], policy);
+
+        if (num_programs == 3 && background)
             return exec(5, command_args[1], command_args[2], command_args[3], policy, "#");
-        }
-        else{
-            fprintf(stderr, "error: too many programs (max 3 supported)\n");
-            return badcommand();
-        }
+
+        fprintf(stderr, "error: too many programs (max 3 supported)\n");
+        return badcommand();
     }
     else
         return badcommand();
@@ -269,6 +275,9 @@ source SCRIPT.TXT		Executes the file SCRIPT.TXT\n ";
 }
 
 int quit() {
+    if (mt_enabled) {
+        stop_scheduler_threads();
+    }
     printf("Bye!\n");
     exit(0);
 }
@@ -431,6 +440,7 @@ int run(char *args[], int arg_size) {
     if (pid < 0) {
         // fork failed. Report the error and move on.
         perror("fork() failed");
+        free(adj_args);
         return 1;
     } else if (pid == 0) {
         // we are the new child process.
@@ -449,6 +459,7 @@ int run(char *args[], int arg_size) {
     } else {
         // we are the parent process.
         waitpid(pid, NULL, 0);
+        free(adj_args);
     }
 
     return 0;
@@ -464,6 +475,7 @@ int exec (int count, ...){
     }
 
     va_end(args);
+
     int background = 0;
     if (strcmp(arg_array[count - 1], "#") == 0) {
         background = 1;
@@ -477,24 +489,27 @@ int exec (int count, ...){
         mode_index = count - 1;
     }
     char * mode = arg_array[mode_index];
-    int num_programs = mode_index; 
+    int num_programs = mode_index;
     
     int pids[3] = {0};
     int pid_index = 0;
     int batch_pid = -1;
-    PCB* batch_script = NULL;
+    char *batch_buf = NULL;
     //If we have a #, create batch PCB and inserting it at the front of the queue
     if (background){
-        FILE *batch_file = get_batch_input();
+        FILE *batch_file = get_batch_input(&batch_buf);
         if (batch_file != NULL){
             batch_pid = add_script(batch_file);
             fclose(batch_file);
+            free(batch_buf);
+            batch_buf = NULL;
 
             if (batch_pid == -1){
                 fprintf(stderr, "failed to load batch script process\n");
                 return -1;
             }
             // Find the PCB in queue with that PID and set priority, should just be the head but just in case
+            pthread_mutex_lock(&queue_mutex);
             PCB *current = q.head;
             while (current != NULL) {
                 if (current->PID == batch_pid) {
@@ -504,6 +519,7 @@ int exec (int count, ...){
                 }
                 current = current->next;
             }
+            pthread_mutex_unlock(&queue_mutex);
         }
     }
     //Loading program files
@@ -524,7 +540,7 @@ int exec (int count, ...){
         fclose(f);
         
         if (pids[pid_index] == -1) {
-            fprintf(stderr, "not enough memory for file: %s\n", arg_array[i]);
+            fprintf(stderr, "not enough memory for file");
             for (int j = 0; j < pid_index; j++){
                 clean_script(pids[j]);
             }
@@ -536,31 +552,51 @@ int exec (int count, ...){
     }
 
     if (strcmp(mode, "FCFS") == 0){
+        if (mt_enabled) {
+            return multithread_execution(mode);
+        }
         run_queue();
+
     } else if (strcmp(mode, "SJF") == 0){
+        if (mt_enabled) {
+            return multithread_execution(mode);
+        }
         run_queue_sjf();
+
     } else if (strcmp(mode, "RR") == 0){
+        if (mt_enabled) {
+            return multithread_execution(mode);
+        }
         run_queue_rr(2);
+
     } else if (strcmp(mode, "AGING") == 0) {
+        if (mt_enabled) {
+            return multithread_execution(mode);
+        }
         run_queue_sjf_aging();
+
     } else if (strcmp(mode, "RR30") == 0){
+        if (mt_enabled) {
+            return multithread_execution(mode);
+        }
         run_queue_rr(30);
     } else {
-        fprintf(stderr, "invalid scheduling mode: %s\n", mode);
+        fprintf(stderr, "invalid scheduling mode");
         for (int j = 0; j < pid_index; j++)
             clean_script(pids[j]);
-        if (batch_script != 1){
+        if (batch_pid != -1){
             clean_script(batch_pid);
         }
         return -1;
     }
-
-    for (int i = 0; i < pid_index; i++) {
+    // Single-threaded cleanup
+    // FIX #6: correct conditions throughout — no pointer-vs-int comparison,
+    //         no null deref of batch_script
+    for (int i = 0; i < pid_index; i++)
         clean_script(pids[i]);
-    }
-    if (batch_pid) {
-        clean_script(batch_script->PID);
-    }
+    if (batch_pid != -1)
+        clean_script(batch_pid);
+    
 
     return 0;
 }

@@ -60,6 +60,43 @@ int run(char *args[], int args_size);
 int exec(int count, ...);
 int badcommandFileDoesNotExist();
 
+//Helper function which reads the rest of the 
+FILE* get_batch_input(){
+    char line[1000];
+    size_t total_size = 0;
+    size_t capacity = 1024;
+
+    char* buffer = malloc(capacity);
+    if(!buffer){
+        return NULL;
+    }
+    buffer[0] = '\0';
+    //reading the rest of stdin until EOF
+    while (fgets(line, sizeof(line), stdin) != NULL){
+        size_t len = strlen(line);
+
+        //Resize buffer if full
+        if (total_size + len + 1 > capacity){
+            capacity = capacity * 2;
+            char *new_buffer = realloc(buffer, capacity);
+            if (!new_buffer){
+                free(buffer);
+                return NULL;
+            }
+            buffer = new_buffer;
+        }
+        strcat(buffer, line);
+        total_size = total_size + len;
+    }
+    if (total_size == 0){
+        free(buffer);
+        return NULL;
+    }
+    FILE *f = fmemopen(buffer, total_size, "r");
+    return f;
+}
+
+
 // Interpret commands and their arguments
 int interpreter(char *command_args[], int args_size) {
     int i;
@@ -141,28 +178,80 @@ int interpreter(char *command_args[], int args_size) {
             return badcommand();
         return run(&command_args[1], args_size - 1);
 
-    } else if (strcmp(command_args[0], "exec") == 0){
-        if (args_size == 3){
-            return exec(2, command_args[1], command_args[2]);
-        } else if (args_size == 4){
-            if (strcmp(command_args[1], command_args[2]) == 0) {
-                fprintf(stderr, "error: files contain duplicates\n");
-                return 5; //error
-            }
-            return exec(3, command_args[1], command_args[2], command_args[3]);
-        } else if (args_size == 5){
-            for (int i = 1; i < 4; i++){
-                for (int j = i + 1; j < 4; j++){
-                   if (strcmp(command_args[i], command_args[j]) == 0) {
-                        fprintf(stderr, "error: files contain duplicates\n");
-                        return 5; //error
-                    } 
+    } 
+    else if (strcmp(command_args[0], "exec") == 0) {
+        if (args_size < 3) {
+            fprintf(stderr, "error: exec requires at least one program and a policy\n");
+            return badcommand();
+        }
+
+        int background = 0;     //Flag to check if the background execution (#) was called
+        char *policy = NULL;
+        int num_programs = 0;
+        
+        //Background execution is called
+        if (strcmp(command_args[args_size - 1], "#") == 0) {
+            background = 1;
+            policy = command_args[args_size - 2];
+            num_programs = args_size - 3;
+        } 
+        else {
+            background = 0;
+            policy = command_args[args_size - 1];
+            num_programs = args_size - 2;
+        }
+
+        if (num_programs < 1) {
+            fprintf(stderr, "error: no program specified\n");
+            return badcommand();
+        }
+
+        // Checking for duplicates
+        for (int i = 1; i <= num_programs; i++) {
+            for (int j = i + 1; j <= num_programs; j++) {
+                if (strcmp(command_args[i], command_args[j]) == 0) {
+                    fprintf(stderr, "error: duplicate program names\n");
+                    return badcommand();
                 }
             }
-            return exec(4, command_args[1], command_args[2], command_args[3], command_args[4]);
-        } 
-        return badcommand();
-    } else
+        }
+        
+        //Building the call to exec()
+        int total_args = num_programs + 1 + background;     // +1 for the policy
+        //Only total_args with 1 program and 1 policy
+        if (total_args == 2) {
+            return exec(2, command_args[1], policy);
+        }
+        else if (total_args == 3){
+            // 2 programs and 1 policy
+            if (num_programs == 2){
+                    return exec(3, command_args[1], command_args[2], policy);
+            }
+            // 1 program, 1 policy and background
+            else{
+                return exec(3, command_args[1], policy, "#");
+            }
+        }
+        else if (total_args == 4){
+            // 3 programs and 1 policy
+            if (num_programs == 3){
+                return exec(4, command_args[1], command_args[2], command_args[3], policy);
+            }
+            // 2 programs, 1 policy and background
+            else{
+                return exec(4, command_args[1], command_args[2], policy, "#");
+            }
+        }
+        else if (total_args == 5){
+            // 3 programs, 1 policy and background
+            return exec(5, command_args[1], command_args[2], command_args[3], policy, "#");
+        }
+        else{
+            fprintf(stderr, "error: too many programs (max 3 supported)\n");
+            return badcommand();
+        }
+    }
+    else
         return badcommand();
 }
 
@@ -351,7 +440,7 @@ int run(char *args[], int arg_size) {
         // a part of the glibc documentation that you are **not**
         // expected to know for this course, a shared input handle
         // should be fflushed (if it is needed) or closed
-        // (if it is not). Handling this exec error case is not even
+        // (if it is not). Handling this exec error total_args is not even
         // necessary, but let's do it right.
         // (Failure to do this can result in the parent process
         // reading the remaining input twice in batch mode.)
@@ -368,25 +457,83 @@ int run(char *args[], int arg_size) {
 int exec (int count, ...){
     va_list args;
     va_start(args, count);
+    //Copying all arguments into an array
+    char *arg_array[5];
+    for (int i = 0; i < count; i++){
+        arg_array[i] = va_arg(args, char*);
+    }
+
+    va_end(args);
+    int background = 0;
+    if (strcmp(arg_array[count - 1], "#") == 0) {
+        background = 1;
+    }
+
+    int mode_index;
+    if (background == 1){
+        mode_index = count - 2;
+    }
+    else{
+        mode_index = count - 1;
+    }
+    char * mode = arg_array[mode_index];
+    int num_programs = mode_index; 
+    
     int pids[3] = {0};
+    int pid_index = 0;
+    int batch_pid = -1;
+    PCB* batch_script = NULL;
+    //If we have a #, create batch PCB and inserting it at the front of the queue
+    if (background){
+        FILE *batch_file = get_batch_input();
+        if (batch_file != NULL){
+            batch_pid = add_script(batch_file);
+            fclose(batch_file);
 
-    for (int i = 0; i < count - 1; i++){
-        FILE *f = fopen(va_arg(args, char *), "rt");
-        if (f == NULL) {
-            return -1; //failed to open file
-            fprintf(stderr, "file failed to open\n");
-        }
-
-        pids[i] = add_script(f);
-        fclose(f);
-
-        if (pids[i] == -1) {
-            fprintf(stderr, "not enough storage\n");
+            if (batch_pid == -1){
+                fprintf(stderr, "failed to load batch script process\n");
+                return -1;
+            }
+            // Find the PCB in queue with that PID and set priority, should just be the head but just in case
+            PCB *current = q.head;
+            while (current != NULL) {
+                if (current->PID == batch_pid) {
+                    current->priority = 1;
+                    batch_script = current;
+                    break;
+                }
+                current = current->next;
+            }
         }
     }
-    
+    //Loading program files
 
-    char *mode = va_arg(args, char*);
+    for (int i = 0; i < num_programs; i++){
+        FILE *f = fopen(arg_array[i], "rt");
+        if (f == NULL){
+            fprintf(stderr, "file failed to open\n");
+            //Clean up previously loaded scripts
+            for (int j = 0; j < pid_index; j++){
+                clean_script(pids[j]);
+            }
+            if (batch_pid != -1)
+                clean_script(batch_pid);
+            return -1;
+        }
+        pids[pid_index] = add_script(f);
+        fclose(f);
+        
+        if (pids[pid_index] == -1) {
+            fprintf(stderr, "not enough memory for file: %s\n", arg_array[i]);
+            for (int j = 0; j < pid_index; j++){
+                clean_script(pids[j]);
+            }
+            if (batch_pid != -1)
+                clean_script(batch_pid);
+            return -1;
+        }
+        pid_index++;
+    }
 
     if (strcmp(mode, "FCFS") == 0){
         run_queue();
@@ -399,18 +546,22 @@ int exec (int count, ...){
     } else if (strcmp(mode, "RR30") == 0){
         run_queue_rr(30);
     } else {
-        return -1; //error: mode not valid
+        fprintf(stderr, "invalid scheduling mode: %s\n", mode);
+        for (int j = 0; j < pid_index; j++)
+            clean_script(pids[j]);
+        if (batch_script != 1){
+            clean_script(batch_pid);
+        }
+        return -1;
     }
 
-    for (int i = 0; i < 3; i++){
-        if (pids[i] == 0){
-            break;
-        }
-
+    for (int i = 0; i < pid_index; i++) {
         clean_script(pids[i]);
     }
+    if (batch_pid) {
+        clean_script(batch_script->PID);
+    }
 
-    va_end(args);
     return 0;
 }
 

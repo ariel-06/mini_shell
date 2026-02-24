@@ -1,6 +1,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+
 #include "shellmemory.h"
 #include "interpreter.h"
 #include "shell.h"
@@ -34,6 +35,7 @@ typedef struct pcb{
     struct pcb *next;
     struct pcb *prev;
     int job_length_score;
+    int priority;
 } PCB;
 
 typedef struct queue { 
@@ -80,6 +82,7 @@ void enqueue(PCB *node){
         node->prev = q.tail;
     }
     q.tail = node;
+
 }
 
 PCB* dequeue(){ 
@@ -129,6 +132,7 @@ int add_script (FILE *file){
     pcb->next = NULL;
     pcb->prev = NULL;
     pcb->job_length_score = 0;
+    pcb->priority = 0;
 
 
     char buffer[100];
@@ -220,6 +224,24 @@ void sort_queue_sjf(){
 }
 
 void run_queue_sjf() {
+    // If batch script hasn't run yet, run it first
+    PCB *current = q.head;
+    while (current != NULL) {
+        if (current->priority == 1) {
+            current->priority = 0;
+
+            while (current->program_counter < current->length) {
+                parseInput(script_memory[current->program_counter + current->start_index].content);
+                current->program_counter++;
+            }
+
+            // remove it from queue after completion
+            dequeue();
+            break;
+        }
+        current = current->next;
+    }
+
     sort_queue_sjf();
     run_queue();
 }
@@ -243,25 +265,50 @@ void run_queue_rr(int max_time) {
 }
 
 void run_queue_sjf_aging(){
-
     while (q.head != NULL){
+
+        // Force batch process to run first (only once)
+        if (q.head->priority == 1) {
+            PCB *to_run = dequeue();
+            to_run->priority = 0;
+            // Aging scheduler runs ONE line per time slice
+            parseInput(script_memory[to_run->program_counter + to_run->start_index].content);
+            to_run->program_counter++;
+            // Decrease job_length_score of remaining processes
+            PCB *current = q.head;
+            while (current != NULL){
+                if (current->job_length_score > 0)
+                    current->job_length_score--;
+                current = current->next;
+            }
+
+            if (to_run->program_counter < to_run->length){
+                enqueue(to_run);
+            }
+
+            continue; // Skip normal scheduling this iteration
+        }
+
+        // Normal scheduling
         sort_queue_sjf();
         PCB *to_run = dequeue();
+
         PCB *current = q.head;
 
-    //subtracting 1 from the job_length_score of all programs in the queue 
+        // subtract 1 from job_length_score of all programs in queue
         while (current != NULL){
             if (current->job_length_score > 0)
                 current->job_length_score--;
             current = current->next;
         }
 
-        // running a line in the program
+        // run one line
         parseInput(script_memory[to_run->program_counter + to_run->start_index].content);
         to_run->program_counter++;
-        if (to_run->program_counter < to_run->length)
-        enqueue(to_run);
 
+        if (to_run->program_counter < to_run->length){
+            enqueue(to_run);
+        } 
     }
 }
 

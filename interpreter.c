@@ -60,7 +60,7 @@ int run(char *args[], int args_size);
 int exec(int count, ...);
 int badcommandFileDoesNotExist();
 
-//Helper function which reads the rest of the 
+//Reads all remaining lines from stdin into dynamic memory and wraps it in a FILE* using fmemopen()
 FILE *get_batch_input(char **out_buffer) {
     char line[1000];
     size_t total_size = 0;
@@ -70,8 +70,10 @@ FILE *get_batch_input(char **out_buffer) {
     if (!buffer) return NULL;
     buffer[0] = '\0';
 
+    //Reads every remaining line from stdin into the growing buffer
     while (fgets(line, sizeof(line), stdin) != NULL) {
         size_t len = strlen(line);
+        //Doubles the buffer if there is not enough room
         if (total_size + len + 1 > capacity) {
             capacity *= 2;
             char *nb = realloc(buffer, capacity);
@@ -81,32 +83,29 @@ FILE *get_batch_input(char **out_buffer) {
         strcat(buffer, line);
         total_size += len;
     }
-
-    if (total_size == 0) { free(buffer); return NULL; }
+    
+    if (total_size == 0) { free(buffer); return NULL; }   //nothing to read
 
     FILE *f = fmemopen(buffer, total_size, "r");
     if (!f) { free(buffer); return NULL; }
 
-    // FIX #7: give ownership of buffer back to caller so they can free it after fclose
+    //Handing an adress to the buffer so that the caller can free it after fclose
     *out_buffer = buffer;
     return f;
 }
 
-//Helper function which runs the MT execution
+//Helper function which runs the MT execution (starts the worker thread pool)
 int multithread_execution(char *mode) {
-    // FIX #4: start_scheduler_threads always updates policy now;
-    //         if threads are already alive they keep running with the new policy.
+
+    //Always updates the current_policy
     start_scheduler_threads(mode);
 
-    // Wake any threads that may be waiting (in case queue was populated
-    // before threads were started the very first time).
+    // Wake any threads that may be waiting on an empty queue
     pthread_mutex_lock(&queue_mutex);
     pthread_cond_broadcast(&queue_cond);
     pthread_mutex_unlock(&queue_mutex);
 
-    // Wait until every job that was enqueued for this exec call finishes.
-    // This is safe: workers signal active_jobs_cond while holding active_jobs_mutex,
-    // so we cannot miss a signal here.
+    //Block until every job loaded for this exec call has been cleaned up
     pthread_mutex_lock(&active_jobs_mutex);
     while (active_jobs > 0)
         pthread_cond_wait(&active_jobs_cond, &active_jobs_mutex);
@@ -209,7 +208,7 @@ int interpreter(char *command_args[], int args_size) {
         
         // Detect MT
         if (strcmp(command_args[last_index], "MT") == 0) {
-            mt_enabled = 1;     // stays enabled forever
+            mt_enabled = 1;     // stays enabled forever, uses an external variable
             last_index--;
         }
         // Detect #
@@ -468,7 +467,7 @@ int run(char *args[], int arg_size) {
 int exec (int count, ...){
     va_list args;
     va_start(args, count);
-    //Copying all arguments into an array
+    //Copying all arguments into an array for easier indexing
     char *arg_array[5];
     for (int i = 0; i < count; i++){
         arg_array[i] = va_arg(args, char*);
@@ -476,11 +475,13 @@ int exec (int count, ...){
 
     va_end(args);
 
+    //Checking whether the last argument is the background flag
     int background = 0;
     if (strcmp(arg_array[count - 1], "#") == 0) {
         background = 1;
     }
 
+    //Finding the scheduling policy
     int mode_index;
     if (background == 1){
         mode_index = count - 2;
@@ -495,13 +496,13 @@ int exec (int count, ...){
     int pid_index = 0;
     int batch_pid = -1;
     char *batch_buf = NULL;
-    //If we have a #, create batch PCB and inserting it at the front of the queue
+    //If we have a #, load the batch script
     if (background){
         FILE *batch_file = get_batch_input(&batch_buf);
         if (batch_file != NULL){
             batch_pid = add_script(batch_file);
             fclose(batch_file);
-            free(batch_buf);
+            free(batch_buf);   //freeing the buffer from get_batch_input
             batch_buf = NULL;
 
             if (batch_pid == -1){
@@ -514,7 +515,6 @@ int exec (int count, ...){
             while (current != NULL) {
                 if (current->PID == batch_pid) {
                     current->priority = 1;
-                    batch_script = current;
                     break;
                 }
                 current = current->next;
@@ -551,6 +551,7 @@ int exec (int count, ...){
         pid_index++;
     }
 
+    //Dispatching to the appropriate scheduler
     if (strcmp(mode, "FCFS") == 0){
         if (mt_enabled) {
             return multithread_execution(mode);
@@ -589,9 +590,7 @@ int exec (int count, ...){
         }
         return -1;
     }
-    // Single-threaded cleanup
-    // FIX #6: correct conditions throughout — no pointer-vs-int comparison,
-    //         no null deref of batch_script
+    // Single-threaded cleanup (only reached in the single threaded path)
     for (int i = 0; i < pid_index; i++)
         clean_script(pids[i]);
     if (batch_pid != -1)

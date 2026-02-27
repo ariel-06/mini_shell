@@ -41,11 +41,11 @@ Queue q = {NULL, NULL};
 
 //Multi threading variables
 pthread_t workers[2];
-pthread_mutex_t queue_mutex = PTHREAD_MUTEX_INITIALIZER;
-pthread_cond_t queue_cond = PTHREAD_COND_INITIALIZER;
-pthread_mutex_t active_jobs_mutex = PTHREAD_MUTEX_INITIALIZER;
-pthread_cond_t active_jobs_cond = PTHREAD_COND_INITIALIZER;
-pthread_mutex_t shellmem_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t queue_mutex = PTHREAD_MUTEX_INITIALIZER;           //protects the queue and script memory
+pthread_cond_t queue_cond = PTHREAD_COND_INITIALIZER;              //workers wait on this when the queue is empty
+pthread_mutex_t active_jobs_mutex = PTHREAD_MUTEX_INITIALIZER;     //protects the active job counter
+pthread_cond_t active_jobs_cond = PTHREAD_COND_INITIALIZER;        //the main thread waits on this in multithread_execution
+pthread_mutex_t shellmem_mutex = PTHREAD_MUTEX_INITIALIZER;        //protects shell memory
 
 int mt_enabled = 0;          // becomes 1 when MT is activated
 int scheduler_running = 0;   // controls worker loop
@@ -78,6 +78,8 @@ void mem_init() {
 
 }
 
+//Caller must not hold queue_mutex, locks internally
+//Signals queue_cond so that one waiting worker wakes up
 void enqueue(PCB *node) {
     node->next = NULL;
     node->prev = NULL;
@@ -91,10 +93,11 @@ void enqueue(PCB *node) {
         node->prev = q.tail;
         q.tail = node;
     }
-    pthread_cond_signal(&queue_cond);
+    pthread_cond_signal(&queue_cond);   //Wake one waiting worker
     pthread_mutex_unlock(&queue_mutex);
 }
 
+//Locks queue_mutex intenally. Used by single-threaded schedulers.
 PCB* dequeue() {
     pthread_mutex_lock(&queue_mutex);
     PCB *node = q.head;
@@ -115,7 +118,7 @@ PCB* dequeue() {
     return node;
 }
 
-// dequeue_unlocked: caller MUST already hold queue_mutex
+// Caller must already hold queue_mutex
 static PCB* dequeue_unlocked() {
     PCB *node = q.head;
     if (node == NULL) return NULL;
@@ -194,13 +197,10 @@ int add_script (FILE *file){
     pcb->length = i - start;
     pcb->job_length_score = pcb->length;
 
-    // enqueue first (locks queue_mutex internally), then bump active_jobs
-    // FIX #1: consistent lock order — queue_mutex then active_jobs_mutex,
-    //         never the reverse. Here they are separate, non-nested calls.
-    //add the new process to end of the ready queue
+    //Enqueue the PCB (acquires and releases queue_mutex internally)
     enqueue(pcb);
 
-    // Increment active jobs when adding a PCB
+    // Increment active jobs after enqueue to respect locking order
     pthread_mutex_lock(&active_jobs_mutex);
     active_jobs++;
     pthread_mutex_unlock(&active_jobs_mutex);
@@ -348,10 +348,9 @@ void run_queue_sjf_aging(){
     }
 }
 
-// FIX #3: clean_script is now thread-safe — holds queue_mutex while touching the queue
+
 void clean_script(int pid){
-    // Clean script_memory (no lock needed — only touched while queue_mutex held
-    // in worker, or single-threaded otherwise; adding queue_mutex here is safest)
+    // Hold queue_mutex so no other thread can concurrently modify the queue
     pthread_mutex_lock(&queue_mutex);
     PCB *current = q.head;
 
@@ -389,7 +388,7 @@ void clean_script(int pid){
 
 // Set key value pair
 void mem_set_value(char *var_in, char *value_in) {
-    // FIX #5: protect shell memory with its own mutex
+    // Same logic (protecting memory)
     pthread_mutex_lock(&shellmem_mutex);
     for (int i = 0; i < MEM_SIZE; i++) {
         if (strcmp(shellmemory[i].var, var_in) == 0) {
@@ -412,7 +411,7 @@ void mem_set_value(char *var_in, char *value_in) {
 
 //get value based on input key
 char *mem_get_value(char *var_in) {
-    // FIX #5: protect shell memory with its own mutex
+    // Same logic (protecting memory)
     pthread_mutex_lock(&shellmem_mutex);
     for (int i = 0; i < MEM_SIZE; i++) {
         if (strcmp(shellmemory[i].var, var_in) == 0) {
@@ -425,43 +424,62 @@ char *mem_get_value(char *var_in) {
     return NULL;
 }
 
+/* 
+Loop:
+   1. Lock queue_mutex and wait on queue_cond until the queue is non-empty
+      or scheduler_running becomes 0.
+   2. If shutting down and the queue is empty, exit the loop.
+   3. Dequeue one PCB while still holding the lock, then release it.
+   4. Execute according to current_policy:
+        FCFS/SJF: run the entire job to completion in one shot.
+        RR/RR30: run at most one time slice; re-enqueue if not done.
+   5. When a job finishes, call clean_script() then decrement active_jobs
+      and signal active_jobs_cond so multithread_execution() can wake.
+*/
 void *worker_function(void *arg) {
     while (1) {
         pthread_mutex_lock(&queue_mutex);
 
-        // Wait for work or shutdown signal
+        // Wait while the queue is empty and not told to stop
         while (q.head == NULL && scheduler_running)
             pthread_cond_wait(&queue_cond, &queue_mutex);
 
+        //Shutdown if no work left and scheduler is stopping
         if (!scheduler_running && q.head == NULL) {
             pthread_mutex_unlock(&queue_mutex);
             break;
         }
 
+        //Take the next PCB while we still hold the lock
         PCB *pcb = dequeue_unlocked();
         pthread_mutex_unlock(&queue_mutex);
 
         if (pcb == NULL) continue;
 
-        // ---- FCFS / SJF: run entire job ----
+        //FCFS or SJF
         if (strcmp(current_policy, "FCFS") == 0 || strcmp(current_policy, "SJF") == 0) {
             while (pcb->program_counter < pcb->length) {
                 parseInput(script_memory[pcb->start_index + pcb->program_counter].content);
                 pcb->program_counter++;
             }
             int pid = pcb->PID;
-            clean_script(pid); // FIX #3: now thread-safe
+            clean_script(pid);
 
-            // FIX #1: active_jobs_mutex acquired AFTER queue_mutex is released (clean_script released it)
+            // Decreasing the active_jobs counter while preserving the lock order
             pthread_mutex_lock(&active_jobs_mutex);
             active_jobs--;
             pthread_cond_signal(&active_jobs_cond);
             pthread_mutex_unlock(&active_jobs_mutex);
         }
 
-        // ---- RR / RR30: one time slice ----
+        // RR or RR30
         else if (strcmp(current_policy, "RR") == 0 || strcmp(current_policy, "RR30") == 0) {
-            int slice = (strcmp(current_policy, "RR30") == 0) ? 30 : 2;
+            int slice;
+            if (strcmp(current_policy, "RR30") == 0) {
+                slice = 30;
+            } else {
+                slice = 2;
+            }
             int time  = 0;
             while (pcb->program_counter < pcb->length && time < slice) {
                 parseInput(script_memory[pcb->start_index + pcb->program_counter].content);
@@ -472,8 +490,9 @@ void *worker_function(void *arg) {
             if (pcb->program_counter < pcb->length) {
                 enqueue(pcb); // re-queue for next slice (enqueue locks internally)
             } else {
+                //Job finished
                 int pid = pcb->PID;
-                clean_script(pid); // FIX #3: thread-safe
+                clean_script(pid); 
 
                 pthread_mutex_lock(&active_jobs_mutex);
                 active_jobs--;
@@ -486,26 +505,29 @@ void *worker_function(void *arg) {
     return NULL;
 }
 
+//Updates current_policy
+//Starts worker threads if not already running
+//Updating the policy even when threads are alive
 void start_scheduler_threads(char *policy) {
-    // FIX #4: always update the policy, even if threads are already running
     strncpy(current_policy, policy, sizeof(current_policy) - 1);
     current_policy[sizeof(current_policy) - 1] = '\0';
 
     if (scheduler_running)
-        return; // threads already alive, policy updated above — done
+        return; // threads already alive
 
     scheduler_running = 1;
     pthread_create(&workers[0], NULL, worker_function, NULL);
     pthread_create(&workers[1], NULL, worker_function, NULL);
 }
 
+//Signals both workers to exit and joins them
 void stop_scheduler_threads() {
     if (!scheduler_running)
         return;
 
     pthread_mutex_lock(&queue_mutex);
     scheduler_running = 0;
-    pthread_cond_broadcast(&queue_cond);
+    pthread_cond_broadcast(&queue_cond);    //So idle workers wake up and exit their loops
     pthread_mutex_unlock(&queue_mutex);
 
     pthread_join(workers[0], NULL);

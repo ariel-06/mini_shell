@@ -6,7 +6,7 @@
 
 #define MEM_SIZE 1000
 
-// ---- Struct definitions ----
+// Struct definitions
 typedef struct pcb {
     int PID;
     int start_index;
@@ -25,7 +25,7 @@ typedef struct queue {
 
 extern Queue q;
 
-// ---- Threading globals ----
+// Threading globals
 extern pthread_mutex_t queue_mutex;
 extern pthread_cond_t  queue_cond;
 extern pthread_mutex_t active_jobs_mutex;
@@ -35,7 +35,7 @@ extern int mt_enabled;
 extern int active_jobs;
 extern int scheduler_running;
 
-// ---- Function declarations ----
+// Function declarations
 void  mem_init(void);
 char *mem_get_value(char *var);
 void  mem_set_value(char *var, char *value);

@@ -7,6 +7,9 @@
 #define MEM_SIZE 1000
 
 // Struct definitions
+
+//type to store information about a script, 
+//acts as a node in a linked list (ready queue)
 typedef struct pcb {
     int PID;
     int start_index;
@@ -18,6 +21,7 @@ typedef struct pcb {
     int priority;
 } PCB;
 
+//ready queue, implenented as a classic doubly linked list
 typedef struct queue {
     PCB *head;
     PCB *tail;
@@ -34,6 +38,11 @@ extern pthread_cond_t  active_jobs_cond;
 extern int mt_enabled;
 extern int active_jobs;
 extern int scheduler_running;
+extern int quit_called;
+extern int scheduler_active;
+extern int batch_running;
+extern pthread_t workers[2];
+int is_worker_thread(void);
 
 // Function declarations
 void  mem_init(void);

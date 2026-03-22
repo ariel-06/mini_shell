@@ -56,7 +56,7 @@ int my_mkdir(char *name);
 int my_touch(char *path);
 int my_cd(char *path);
 int source(char *script);
-int run(char *args[], int args_size);
+int run(char **args);
 int exec(int count, ...);
 int badcommandFileDoesNotExist();
 
@@ -66,6 +66,7 @@ FILE *get_batch_input(char **out_buffer) {
     size_t total_size = 0;
     size_t capacity   = 1024;
 
+    //Buffer to store the rest of stdin
     char *buffer = malloc(capacity);
     if (!buffer) return NULL;
     buffer[0] = '\0';
@@ -80,7 +81,7 @@ FILE *get_batch_input(char **out_buffer) {
             if (!nb) { free(buffer); return NULL; }
             buffer = nb;
         }
-        strcat(buffer, line);
+        strcat(buffer, line);      //Adds line to the buffeer
         total_size += len;
     }
     
@@ -89,7 +90,7 @@ FILE *get_batch_input(char **out_buffer) {
     FILE *f = fmemopen(buffer, total_size, "r");
     if (!f) { free(buffer); return NULL; }
 
-    //Handing an adress to the buffer so that the caller can free it after fclose
+    //Handing an address to the buffer so that the caller can free it after fclose
     *out_buffer = buffer;
     return f;
 }
@@ -105,9 +106,12 @@ int multithread_execution(char *mode) {
     pthread_cond_broadcast(&queue_cond);
     pthread_mutex_unlock(&queue_mutex);
 
+	//If we are a worker thread, this exec was called from inside a batch script
+	if(is_worker_thread()){return 0;}
+
     //Block until every job loaded for this exec call has been cleaned up
     pthread_mutex_lock(&active_jobs_mutex);
-    while (active_jobs > 0)
+    while (active_jobs > 0 || batch_running)
         pthread_cond_wait(&active_jobs_cond, &active_jobs_mutex);
     pthread_mutex_unlock(&active_jobs_mutex);
 
@@ -194,10 +198,13 @@ int interpreter(char *command_args[], int args_size) {
     } else if (strcmp(command_args[0], "run") == 0) {
         if (args_size < 2)
             return badcommand();
-        return run(&command_args[1], args_size - 1);
+        return run(&command_args[1]);
 
     } 
     else if (strcmp(command_args[0], "exec") == 0) {
+        // exec takes a varible number of args
+        // here we count the number of args and pass that number in exec 
+        // to be able to use va_args
         if (args_size < 3) {
             fprintf(stderr, "error: exec requires at least one program and a policy\n");
             return badcommand();
@@ -216,7 +223,7 @@ int interpreter(char *command_args[], int args_size) {
             background = 1;
             last_index--;
         }
-        // Extract policy
+        // Extract scheduling policy
         char *policy = command_args[last_index];
         int num_programs = last_index - 1;
 
@@ -274,6 +281,7 @@ source SCRIPT.TXT		Executes the file SCRIPT.TXT\n ";
 }
 
 int quit() {
+    //stoping the threads if quit is called in multithreading execution
     if (mt_enabled) {
         stop_scheduler_threads();
     }
@@ -403,28 +411,17 @@ int source(char *script) {
     char line[MAX_USER_INPUT];
     FILE *p = fopen(script, "rt");      // the program is in a file
 
+    // stores script into shell memory and runs it from the ready queue
+    // instead of running each line of the file using fgets
     int pid = add_script(p);
     run_queue();
+    // clears the script from memory after running it
     clean_script(pid);
-
-    /*
-    fgets(line, MAX_USER_INPUT - 1, p);
-    while (1) {
-        errCode = parseInput(line);     // which calls interpreter()
-        memset(line, 0, sizeof(line));
-
-        if (feof(p)) {
-            break;
-        }
-        fgets(line, MAX_USER_INPUT - 1, p);
-    }
-    */
-    
     fclose(p);
 
     return errCode;
 }
-
+/*
 int run(char *args[], int arg_size) {
     // copy the args into a new NULL-terminated array.
     char **adj_args = calloc(arg_size + 1, sizeof(char *));
@@ -463,8 +460,24 @@ int run(char *args[], int arg_size) {
 
     return 0;
 }
+*/
 
 int exec (int count, ...){
+/*
+executes a variable number of input scripts based on 
+the scheduling policy 
+
+inputs:
+count: number of args that are passed into this function
+args 2 - 5: filenames of the scripts to run
+last arg: the scheduling policy to use when running the script or the background flag
+remark: arguments 2 - 6 do no have specific names yet because we need to 
+use va_args to handle different numbers of files
+
+returns: 0 on success and -1 on failure
+*/
+
+    //initializes an argument array based on count
     va_list args;
     va_start(args, count);
     //Copying all arguments into an array for easier indexing
@@ -492,14 +505,19 @@ int exec (int count, ...){
     char * mode = arg_array[mode_index];
     int num_programs = mode_index;
     
-    int pids[3] = {0};
+    //array of pids of all the scripts being added to memory, default 0 becuase they don't have pids yet
+    //unused indices will remain 0 but that's okay
+    int pids[10] = {0};
     int pid_index = 0;
     int batch_pid = -1;
     char *batch_buf = NULL;
-    //If we have a #, load the batch script
+
+    //If we have a #, load the batch script as if it were a file
     if (background){
+        //Tries to create a file from the rest of stdin
         FILE *batch_file = get_batch_input(&batch_buf);
         if (batch_file != NULL){
+            //if it succeeded, add it to the queue
             batch_pid = add_script(batch_file);
             fclose(batch_file);
             free(batch_buf);   //freeing the buffer from get_batch_input
@@ -515,6 +533,11 @@ int exec (int count, ...){
             while (current != NULL) {
                 if (current->PID == batch_pid) {
                     current->priority = 1;
+			if(mt_enabled){
+				pthread_mutex_lock(&active_jobs_mutex);
+				batch_running = 1;
+				pthread_mutex_unlock(&active_jobs_mutex);
+			}
                     break;
                 }
                 current = current->next;
@@ -522,9 +545,10 @@ int exec (int count, ...){
             pthread_mutex_unlock(&queue_mutex);
         }
     }
-    //Loading program files
 
+    //Loading the other program files
     for (int i = 0; i < num_programs; i++){
+        //try to open the file
         FILE *f = fopen(arg_array[i], "rt");
         if (f == NULL){
             fprintf(stderr, "file failed to open\n");
@@ -536,9 +560,15 @@ int exec (int count, ...){
                 clean_script(batch_pid);
             return -1;
         }
+        //try to add the script to shell memory
         pids[pid_index] = add_script(f);
         fclose(f);
         
+        // if the script cannot be added due to storage constraints
+        // add_script returns -1 to indicate failure
+        // so if pids[i] is -1
+        // then the script failed to be added to memory
+
         if (pids[pid_index] == -1) {
             fprintf(stderr, "not enough memory for file");
             for (int j = 0; j < pid_index; j++){
@@ -550,38 +580,48 @@ int exec (int count, ...){
         }
         pid_index++;
     }
+	
+	if (scheduler_active){return 0;}
+	scheduler_active = 1;
 
     //Dispatching to the appropriate scheduler
     if (strcmp(mode, "FCFS") == 0){
         if (mt_enabled) {
+		scheduler_active = 0;
             return multithread_execution(mode);
         }
         run_queue();
 
     } else if (strcmp(mode, "SJF") == 0){
         if (mt_enabled) {
+		scheduler_active = 0;
             return multithread_execution(mode);
         }
         run_queue_sjf();
 
     } else if (strcmp(mode, "RR") == 0){
         if (mt_enabled) {
+		scheduler_active = 0;
             return multithread_execution(mode);
         }
         run_queue_rr(2);
 
     } else if (strcmp(mode, "AGING") == 0) {
         if (mt_enabled) {
+		scheduler_active = 0;
             return multithread_execution(mode);
         }
         run_queue_sjf_aging();
 
     } else if (strcmp(mode, "RR30") == 0){
         if (mt_enabled) {
+		scheduler_active = 0;
             return multithread_execution(mode);
         }
         run_queue_rr(30);
     } else {
+		scheduler_active = 0;
+        //invalid scheduling policy, clean up and return failure
         fprintf(stderr, "invalid scheduling mode");
         for (int j = 0; j < pid_index; j++)
             clean_script(pids[j]);
@@ -590,6 +630,8 @@ int exec (int count, ...){
         }
         return -1;
     }
+	scheduler_active = 0;
+
     // Single-threaded cleanup (only reached in the single threaded path)
     for (int i = 0; i < pid_index; i++)
         clean_script(pids[i]);
@@ -601,8 +643,9 @@ int exec (int count, ...){
 }
 
 
-/*
+
 int run(char **args){
+    /*
     
     Uses a "fork-exec-wait" to run other commands. It forks the shell and calls execvp to execute the given command.
 
@@ -611,6 +654,7 @@ int run(char **args){
     inputs: **args: pointer to the command line arguments after run
     
     Returns 0 on success and 1 on failure. Output of the specified process.
+    */
     
     //Setting up pid and forking
     pid_t pid = fork();
@@ -630,4 +674,4 @@ int run(char **args){
     }
     return 0;
 }
-*/
+

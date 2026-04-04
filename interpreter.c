@@ -413,7 +413,7 @@ int source(char *script) {
 
     // stores script into shell memory and runs it from the ready queue
     // instead of running each line of the file using fgets
-    int pid = add_script(p);
+    int pid = add_script(p, script);
     run_queue();
     // clears the script from memory after running it
     clean_script(pid);
@@ -518,7 +518,7 @@ returns: 0 on success and -1 on failure
         FILE *batch_file = get_batch_input(&batch_buf);
         if (batch_file != NULL){
             //if it succeeded, add it to the queue
-            batch_pid = add_script(batch_file);
+            batch_pid = add_script(batch_file, "stdin");
             fclose(batch_file);
             free(batch_buf);   //freeing the buffer from get_batch_input
             batch_buf = NULL;
@@ -561,7 +561,7 @@ returns: 0 on success and -1 on failure
             return -1;
         }
         //try to add the script to shell memory
-        pids[pid_index] = add_script(f);
+        pids[pid_index] = add_script(f, arg_array[i]);
         fclose(f);
         
         // if the script cannot be added due to storage constraints

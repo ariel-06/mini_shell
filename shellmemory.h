@@ -19,6 +19,9 @@ typedef struct pcb {
     struct pcb *prev;
     int job_length_score;
     int priority;
+    char* filename;
+    int* pages; 
+    int num_pages;
 } PCB;
 
 //ready queue, implenented as a classic doubly linked list
@@ -49,7 +52,7 @@ void  mem_init(void);
 char *mem_get_value(char *var);
 void  mem_set_value(char *var, char *value);
 
-int  add_script(FILE *f);
+int  add_script(FILE *f, char* filename);
 void clean_script(int pid);
 void run_queue(void);
 void run_queue_sjf(void);

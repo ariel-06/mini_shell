@@ -1,0 +1,6 @@
+Shell version 1.5 created Dec 2025
+shell
+shell
+short_program
+quit
+Bye!

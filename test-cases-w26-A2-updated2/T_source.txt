@@ -1,2 +1,0 @@
-source P_short
-quit

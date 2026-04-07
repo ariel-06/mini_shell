@@ -1,4 +1,0 @@
-Shell version 1.4 created December 2024
-
-short_program
-Bye!

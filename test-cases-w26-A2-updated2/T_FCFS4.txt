@@ -1,2 +1,0 @@
-exec P_file1 P_file2 P_file3 FCFS
-quit

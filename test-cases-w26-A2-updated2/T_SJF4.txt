@@ -1,1 +1,0 @@
-exec P_longP1 P_short P_quit SJF

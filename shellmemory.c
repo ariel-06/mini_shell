@@ -10,9 +10,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
+#include <limits.h>
 #include "shellmemory.h"
 #include "interpreter.h"
 #include "shell.h"
+
 
 struct memory_struct
 {
@@ -25,7 +27,7 @@ struct memory_struct
 // extra space for nested exec inside the batch
 int avail_file_numbers[10] = {1, 1, 1, 1, 1, 1, 1, 1, 1, 1};
 
-struct memory_struct shellmemory[MEM_SIZE];
+struct memory_struct shellmemory[VAR_STORE_SIZE];
 char current_policy[16]; // stores active scheduling policy
 
 // type to store a line in a script
@@ -40,7 +42,7 @@ typedef struct line {
 
 // array containing all lines from all scripts that are in memory,
 // max size 1000 lines as per assignment specification
-Line script_memory[1000];
+Line script_memory[FRAME_STORE_SIZE];
 
 typedef struct page_entry {
     struct page_entry* next;
@@ -53,10 +55,19 @@ typedef struct pages {
     Page_Entry* tail;
 } Pages;
 
+
+Frame_Owners frame_owners[FRAME_STORE_SIZE / FRAME_SIZE];
+
 Pages ps = {NULL, NULL};
 
 // initial ready queue (head = NULL and tail = NULL because the queue is empty)
 Queue q = {NULL, NULL};
+
+//Array that indicates how many programs use each frame
+int frame_count[FRAME_STORE_SIZE / FRAME_SIZE];
+
+//Global clock used to keep track of when frames are used
+int lru_clock = 0;
 
 // Multi threading variables
 pthread_t workers[2];
@@ -118,7 +129,7 @@ void page_enqueue(int page_num){//we can add to the front bc it doesn't matter w
 // Shell memory functions
 void mem_init(){
     int i;
-    for (i = 0; i < MEM_SIZE; i++)
+    for (i = 0; i < VAR_STORE_SIZE; i++)
     {
         shellmemory[i].var = "none";
         shellmemory[i].value = "none";
@@ -126,9 +137,15 @@ void mem_init(){
 
 
     //initializes page queue to have all available pages
-    for (int i = 0; i < 333; i++){
+    for (int i = 0; i < FRAME_STORE_SIZE/FRAME_SIZE; i++){
+        for (int j = 0; j < 10; j++){
+        frame_owners[i].pcbs[j] = NULL;
+        }
+        frame_owners[i].page_num = -1;
+        frame_owners[i].last_used = 0;
         page_enqueue(i);
     }
+    memset(frame_count, 0, sizeof(frame_count));
 }
 
 // Basic enqueue for doubly linked list
@@ -244,10 +261,12 @@ int add_script(FILE *file, char *filename){
         if (strcmp(filename, cur->filename) == 0){
             pcb->PID = pid;
             pcb->length = cur->length;
+            pcb->program_counter = 0;
             pcb->next = NULL;
             pcb->prev = NULL;
             pcb->job_length_score = cur->job_length_score;
             pcb->priority = 0;
+            pcb->num_pages = cur->num_pages;
             pcb->filename = strdup(cur->filename);
             duplicate = 1;
 
@@ -257,6 +276,20 @@ int add_script(FILE *file, char *filename){
 
             pcb->pages = malloc(sizeof(int) * 500);
             memcpy(pcb->pages, pages, sizeof(int) * 500);
+            for (int i = 0; i < cur->num_pages; i++) {
+                if (cur->pages[i] != -1){
+                    frame_count[cur->pages[i]]++;
+
+                    int frame = cur->pages[i];
+                    for (int j = 0; j < 10; j++){
+                        if (frame_owners[frame].pcbs[j] == NULL){
+                            frame_owners[frame].pcbs[j] = pcb;
+                            break;
+                        }
+                    }
+                }
+            }
+            break;
         }
 
         cur = cur->next;
@@ -275,6 +308,10 @@ int add_script(FILE *file, char *filename){
         pcb->priority = 0;         // priority flag to distinguish the PCB created from background execution
         pcb->num_pages = 0; 
         pcb->pages = malloc(sizeof(int) * 500);
+        for (int i = 0; i < 500; i++){
+            //indicator that none of the pages have been loaded
+            pcb->pages[i] = -1;
+        }
         pcb->filename = strdup(filename);
 
         // each line has max 100 chars
@@ -285,10 +322,10 @@ int add_script(FILE *file, char *filename){
                 // if we reach end of line memory before the whole file is stored:
                 // delete all previously stored lines and return with failure
                 for (int i = 0; i < pcb->num_pages; i++){
-                    for (int j = 0; j < 3; j++){
-                        free(script_memory[pcb->pages[i] * 3 + j].content);
-                        script_memory[pcb->pages[i] * 3 + j].content = NULL;
-                        script_memory[pcb->pages[i] * 3 + j].owner = 0;
+                    for (int j = 0; j < FRAME_SIZE; j++){
+                        free(script_memory[pcb->pages[i] * FRAME_SIZE + j].content);
+                        script_memory[pcb->pages[i] * FRAME_SIZE + j].content = NULL;
+                        script_memory[pcb->pages[i] * FRAME_SIZE + j].owner = 0;
                     }
                 }
 
@@ -297,17 +334,37 @@ int add_script(FILE *file, char *filename){
                 free(pcb);
                 return -1;
             }
-        
+            // stop after 2 pages for demand paging
+            if (pcb->num_pages >= 2){
+                // buffer already has the first unloaded line, count it
+                pcb->length++;
+                // then count the rest
+                while (fgets(buffer, 100, file) != NULL){
+                    pcb->length++;
+                }
+                break;
+            } 
+
             //get next available page to store
             int page = page_dequeue();
             pcb->pages[pcb->num_pages] = page;
             pcb->num_pages += 1;
+            frame_count[page]++;
+
+            // register PCB in frame_owners
+            frame_owners[page].page_num = pcb->num_pages - 1;  // logical page number
+            for (int j = 0; j < 10; j++){
+                if (frame_owners[page].pcbs[j] == NULL){
+                    frame_owners[page].pcbs[j] = pcb;
+                    break;
+                }
+            }
 
             // otherwise store up to  3 lines from the file into memory
-            for (int i = 0; i < 3; i++){
+            for (int i = 0; i < FRAME_SIZE; i++){
                 char *line = strdup(buffer);
-                script_memory[page * 3 + i].content = line;
-                script_memory[page * 3 + i].owner = pid;
+                script_memory[page * FRAME_SIZE + i].content = line;
+                script_memory[page * FRAME_SIZE + i].owner = pid;
                 pcb->length++;
 
                 if (i == 2){
@@ -319,13 +376,12 @@ int add_script(FILE *file, char *filename){
             }
 
         }
-
         
         pcb->job_length_score = pcb->length;
 
         // add the new process to end of the ready queue (acquires and releases queue_mutex internally)
-        enqueue(pcb);
     }
+    enqueue(pcb);
     // Increment active jobs after enqueue to respect locking order
     pthread_mutex_lock(&active_jobs_mutex);
     active_jobs++;
@@ -336,11 +392,137 @@ int add_script(FILE *file, char *filename){
     return pcb->PID;
 }
 
-int get_line (PCB *program, int pc){
-    int page_number = program->pages[pc / 3];
-    int offset = pc % 3;
+int load_page(PCB *pcb, int page_num) {
+    // open the file
+    FILE *file = fopen(pcb->filename, "rt");
+    if (file == NULL) return -1;
 
-    return page_number * 3 + offset;
+    // skip to the right position in the file
+    char buffer[100];
+    int lines_to_skip = page_num * FRAME_SIZE;
+    for (int i = 0; i < lines_to_skip; i++){
+        if (fgets(buffer, 100, file) == NULL){
+            fclose(file);
+            return -1; // page_num is out of bounds
+        }
+    }
+
+    // get a free frame, evicting if necessary
+    int frame;
+    if (ps.head != NULL){
+        // free frame available
+        frame = page_dequeue();
+        printf("Page fault!\n");
+    } else {
+        // no free frame, need to evict
+        frame = evict_frame(); 
+    }
+
+    // load up to FRAME_SIZE lines into the frame
+    for (int i = 0; i < FRAME_SIZE; i++){
+        if (fgets(buffer, 100, file) == NULL) break;
+        script_memory[frame * FRAME_SIZE + i].content = strdup(buffer);
+        script_memory[frame * FRAME_SIZE + i].owner = pcb->PID;
+    }
+
+    fclose(file);
+
+    // update page table
+    pcb->pages[page_num] = frame;
+    pcb->num_pages++;
+
+    // update frame_owners
+    frame_owners[frame].page_num = page_num;
+    frame_owners[frame].last_used = lru_clock++;
+    for (int i = 0; i < 10; i++){
+        if (frame_owners[frame].pcbs[i] == NULL){
+            frame_owners[frame].pcbs[i] = pcb;
+            break;
+        }
+    }
+
+    // update refcount
+    frame_count[frame]++;
+
+    // update all other PCBs with the same filename
+    PCB *cur = q.head;
+    while (cur != NULL){
+        if (cur != pcb && strcmp(cur->filename, pcb->filename) == 0){
+            // update their page table too
+            cur->pages[page_num] = frame;
+            cur->num_pages++;
+            // register them in frame_owners too
+            for (int j = 0; j < 10; j++){
+                if (frame_owners[frame].pcbs[j] == NULL){
+                    frame_owners[frame].pcbs[j] = cur;
+                    break;
+                }
+            }
+            frame_count[frame]++;
+        }
+        cur = cur->next;
+    }
+
+    return 0;
+}
+
+int evict_frame() {
+    // find the least recently used frame
+    int frame = -1;
+    int min_time = INT_MAX;
+    for (int i = 0; i < FRAME_STORE_SIZE / FRAME_SIZE; i++){
+        if (frame_owners[i].page_num != -1 && frame_owners[i].last_used < min_time){
+            min_time = frame_owners[i].last_used;
+            frame = i;
+        }
+    }
+
+    // print required message
+    printf("Page fault!\nVictim page contents:\n");
+    for (int i = 0; i < FRAME_SIZE; i++){
+        if (script_memory[frame * FRAME_SIZE + i].content != NULL){
+            printf("%s", script_memory[frame * FRAME_SIZE + i].content);
+        }
+    }
+    printf("End of victim page contents.\n");
+
+    // update all owner PCBs' page tables to -1
+    int page_num = frame_owners[frame].page_num;
+    for (int i = 0; i < 10; i++){
+        if (frame_owners[frame].pcbs[i] != NULL){
+            frame_owners[frame].pcbs[i]->pages[page_num] = -1;
+            frame_owners[frame].pcbs[i] = NULL;
+        }
+    }
+
+    // clear the frame from script_memory
+    for (int i = 0; i < FRAME_SIZE; i++){
+        free(script_memory[frame * FRAME_SIZE + i].content);
+        script_memory[frame * FRAME_SIZE + i].content = NULL;
+        script_memory[frame * FRAME_SIZE + i].owner = 0;
+    }
+
+    // reset frame metadata
+    frame_owners[frame].page_num = -1;
+    frame_count[frame] = 0;
+
+    return frame;
+}
+
+int get_line(PCB *program, int pc){
+    int page_number = pc / FRAME_SIZE;
+    int frame = program->pages[page_number];
+    
+    if (frame == -1){
+        // page fault — page is not loaded
+        return -1;  // signal a page fault to the caller
+    }
+
+    // update LRU timestamp
+    frame_owners[frame].last_used = lru_clock++;
+
+    int offset = pc % FRAME_SIZE;
+    return frame * FRAME_SIZE + offset;
 }
 
 void run_queue(){ // default run queue used in source and fcfs
@@ -358,8 +540,13 @@ void run_queue(){ // default run queue used in source and fcfs
     {
         while (current->program_counter < current->length)
         {
-            // runs the entirety of each program
-            parseInput(script_memory[get_line(current, current->program_counter)].content);
+            int line = get_line(current, current->program_counter);
+            if (line == -1){
+                load_page(current, current->program_counter / FRAME_SIZE);
+                // no re-enqueue needed, just continue running
+                continue;
+            }
+            parseInput(script_memory[line].content);
             current->program_counter++;
         }
         // moves to next node
@@ -458,6 +645,7 @@ void run_queue_sjf(){
     run_queue();
 }
 
+
 void run_queue_rr(int max_time){
     /*
     scheduling policy: RR & RR30 -> cycles through all the scritps in the ready queue,
@@ -473,22 +661,28 @@ void run_queue_rr(int max_time){
     int time = 0;
     while (q.head != NULL)
     {
-        // while the head exists -> ie while there is still a script to run
         PCB *current = dequeue();
         time = 0;
+        int page_fault = 0;  // flag to track page fault
+
         while (current->program_counter < current->length && time < max_time)
         {
-            // run script until time runs out or until there are no more lines to run
-            parseInput(script_memory[get_line(current, current->program_counter)].content);
+            int line = get_line(current, current->program_counter);
+            if (line == -1){
+                load_page(current, current->program_counter / FRAME_SIZE);
+                enqueue(current);
+                page_fault = 1;
+                break;
+            } 
+            parseInput(script_memory[line].content);
             current->program_counter++;
             time++;
         }
 
-        // reset time to 0 for the next script to be ran
         time = 0;
 
-        // if the current script is not done running, add it to the back of the ready queue
-        if (current->program_counter < current->length)
+        // only re-enqueue if not already re-enqueued due to page fault
+        if (!page_fault && current->program_counter < current->length)
         {
             enqueue(current);
         }
@@ -546,43 +740,40 @@ void run_queue_sjf_aging(){
     }
 }
 
+
 void clean_script(int pid){
     /*
-        clears all the memory related to the script with the pid specified
+        clears all the memory related to the script with the pid specified if no other duplicate scripts
 
         inputs:
         int pid: pid of the program to remove
 
         returns: nothing
     */
-
-    // Hold queue_mutex so no other thread can concurrently modify the queue
     pthread_mutex_lock(&queue_mutex);
+
     PCB *current = q.head;
-
-    // free all the lines that are stored in the line array related to this script
-    // by checking the owner field
-    for (int i = 0; i < 1000; i++)
-    {
-        if (script_memory[i].owner == pid)
-        {
-            script_memory[i].owner = 0;
-            free(script_memory[i].content);
-            script_memory[i].content = NULL;
-        }
-    }
-
-    // find the pcb that is related to the pid specified
     while (current != NULL)
     {   
-        // adds all the pages that it occupied back into available memory 
-        // removes it from the ready queue and frees the related memory
         if (current->PID == pid)
         {
+            // decrement refcount for each loaded frame
+            // but do NOT free the frames or return them to the free pool
             for (int i = 0; i < current->num_pages; i++){
-                page_enqueue(current->pages[i]);
+                int frame = current->pages[i];
+                if (frame != -1){  // only decrement if page is actually loaded
+                    frame_count[frame]--;
+                    // remove this PCB from frame_owners
+                    for (int j = 0; j < 10; j++){
+                        if (frame_owners[frame].pcbs[j] == current){
+                            frame_owners[frame].pcbs[j] = NULL;
+                            break;
+                        }
+                    }
+                }
             }
 
+            // remove PCB from the ready queue
             if (current == q.head)
                 q.head = current->next;
             else
@@ -603,7 +794,6 @@ void clean_script(int pid){
             current = current->next;
     }
 
-    // makes the associated pid available again
     avail_file_numbers[pid - 1] = 1;
     pthread_mutex_unlock(&queue_mutex);
 }
@@ -613,7 +803,7 @@ void mem_set_value(char *var_in, char *value_in)
 {
     // Same logic (protecting memory)
     pthread_mutex_lock(&shellmem_mutex);
-    for (int i = 0; i < MEM_SIZE; i++)
+    for (int i = 0; i < VAR_STORE_SIZE; i++)
     {
         if (strcmp(shellmemory[i].var, var_in) == 0)
         {
@@ -624,7 +814,7 @@ void mem_set_value(char *var_in, char *value_in)
         }
     }
     // Value does not exist, need to find a free spot.
-    for (int i = 0; i < MEM_SIZE; i++)
+    for (int i = 0; i < VAR_STORE_SIZE; i++)
     {
         if (strcmp(shellmemory[i].var, "none") == 0)
         {
@@ -642,7 +832,7 @@ char *mem_get_value(char *var_in)
 {
     // Same logic (protecting memory)
     pthread_mutex_lock(&shellmem_mutex);
-    for (int i = 0; i < MEM_SIZE; i++)
+    for (int i = 0; i < VAR_STORE_SIZE; i++)
     {
         if (strcmp(shellmemory[i].var, var_in) == 0)
         {

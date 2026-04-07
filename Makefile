@@ -1,5 +1,7 @@
+framesize ?= 999
+varmemsize ?= 1000
 CC=gcc
-CFLAGS=
+CFLAGS=-D FRAME_STORE_SIZE=$(framesize) -D VAR_STORE_SIZE=$(varmemsize) -D FRAME_SIZE=3
 FMT=indent
 
 mysh: shell.c interpreter.c shellmemory.c

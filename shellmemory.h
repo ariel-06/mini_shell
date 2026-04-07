@@ -4,7 +4,9 @@
 #include <stdio.h>
 #include <pthread.h>
 
-#define MEM_SIZE 1000
+//#define MEM_SIZE 1000
+//#define FRAME_STORE_SIZE 333;
+//#define FRAME_SIZE 3;
 
 // Struct definitions
 
@@ -24,7 +26,15 @@ typedef struct pcb {
     int num_pages;
 } PCB;
 
-//ready queue, implenented as a classic doubly linked list
+typedef struct {
+    PCB *pcbs[10];
+    int page_num;
+    int last_used; //timestamp of last access
+} Frame_Owners;
+
+extern Frame_Owner frame_owners[];
+
+//ready queue, implemented as a classic doubly linked list
 typedef struct queue {
     PCB *head;
     PCB *tail;

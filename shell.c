@@ -50,7 +50,7 @@ int main(int argc, char *argv[]) {
 
 int main(int argc, char *argv[])
 {
-    printf("Shell version 1.5 created Dec 2025\n");
+    printf("Frame Store Size = %d; Variable Store Size = %d\n", FRAME_STORE_SIZE, VAR_STORE_SIZE);
 
     char prompt = '$';              // Shell prompt
     char userInput[MAX_USER_INPUT]; // user's input stored here

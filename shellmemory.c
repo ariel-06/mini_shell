@@ -83,6 +83,8 @@ int active_jobs = 0;       // number of active scripts being processed
 int scheduler_active = 0;
 int batch_running = 0;
 
+int evict_frame(int print_message);
+
 int is_worker_thread()
 {
     return (pthread_self() == workers[0] || pthread_self() == workers[1]);
@@ -106,8 +108,10 @@ int match(char *model, char *var){
 
 int page_dequeue(void) {
     if (ps.head == NULL){
+	//printf("page_dequeue failed\n");
         return -1; //fail bc no pages available
     }
+    //printf("page_dequeue succeeded\n");
     Page_Entry *temp = ps.head;
     ps.head = ps.head->next;
     temp->next = NULL;
@@ -318,23 +322,7 @@ int add_script(FILE *file, char *filename){
         char buffer[100];
         // tries to store each line in the file to slots in the line array
         while (fgets(buffer, 100, file) != NULL){
-            if (ps.head == NULL){
-                // if we reach end of line memory before the whole file is stored:
-                // delete all previously stored lines and return with failure
-                for (int i = 0; i < pcb->num_pages; i++){
-                    for (int j = 0; j < FRAME_SIZE; j++){
-                        free(script_memory[pcb->pages[i] * FRAME_SIZE + j].content);
-                        script_memory[pcb->pages[i] * FRAME_SIZE + j].content = NULL;
-                        script_memory[pcb->pages[i] * FRAME_SIZE + j].owner = 0;
-                    }
-                }
-
-                // the pcb cannot be added so make the reserved pid available again
-                avail_file_numbers[pid - 1] = 1;
-                free(pcb);
-                return -1;
-            }
-            // stop after 2 pages for demand paging
+	    // stop after 2 pages for demand paging
             if (pcb->num_pages >= 2){
                 // buffer already has the first unloaded line, count it
                 pcb->length++;
@@ -345,8 +333,17 @@ int add_script(FILE *file, char *filename){
                 break;
             } 
 
+            if (ps.head == NULL){
+                // if we reach end of line memory before the whole file is stored:
+                // delete all previously stored lines and return with failure
+              int freed_frame =  evict_frame(0);
+	      page_enqueue(freed_frame);
+		//printf("Eviction happens\n");
+            }
+
             //get next available page to store
             int page = page_dequeue();
+		//printf("Frame returned: %d\n", page);
             pcb->pages[pcb->num_pages] = page;
             pcb->num_pages += 1;
             frame_count[page]++;
@@ -381,6 +378,23 @@ int add_script(FILE *file, char *filename){
 
         // add the new process to end of the ready queue (acquires and releases queue_mutex internally)
     }
+/*
+	//Debug
+	printf("PID %d (%s): loaded %d pages, frames: ", pid, filename, pcb-> num_pages);
+	for (int i = 0; i < pcb->num_pages; i++){
+		printf("%d ", pcb->pages[i]);
+	}
+	printf( "\n");
+	//count free frames
+	int free_frames = 0;
+	Page_Entry *temp = ps.head;
+	while (temp != NULL){
+		free_frames++;
+		temp = temp->next;
+	}
+	printf("free frames remaining: %d\n", free_frames);
+*/
+
     enqueue(pcb);
     // Increment active jobs after enqueue to respect locking order
     pthread_mutex_lock(&active_jobs_mutex);
@@ -415,7 +429,7 @@ int load_page(PCB *pcb, int page_num) {
         printf("Page fault!\n");
     } else {
         // no free frame, need to evict
-        frame = evict_frame(); 
+        frame = evict_frame(1); 
     }
 
     // load up to FRAME_SIZE lines into the frame
@@ -466,7 +480,7 @@ int load_page(PCB *pcb, int page_num) {
     return 0;
 }
 
-int evict_frame() {
+int evict_frame(int print_message) {
     // find the least recently used frame
     int frame = -1;
     int min_time = INT_MAX;
@@ -476,15 +490,18 @@ int evict_frame() {
             frame = i;
         }
     }
-
+	
+    if (print_message){
     // print required message
-    printf("Page fault!\nVictim page contents:\n");
+    printf("Page fault! Victim page contents:\n\n");
     for (int i = 0; i < FRAME_SIZE; i++){
         if (script_memory[frame * FRAME_SIZE + i].content != NULL){
             printf("%s", script_memory[frame * FRAME_SIZE + i].content);
         }
     }
+    printf("\n");
     printf("End of victim page contents.\n");
+    }
 
     // update all owner PCBs' page tables to -1
     int page_num = frame_owners[frame].page_num;

@@ -231,6 +231,7 @@ int interpreter(char *command_args[], int args_size) {
             fprintf(stderr, "error: no program specified\n");
             return badcommand();
         }
+/*
         // Checking for duplicates
         for (int i = 1; i <= num_programs; i++) {
             for (int j = i + 1; j <= num_programs; j++) {
@@ -240,6 +241,7 @@ int interpreter(char *command_args[], int args_size) {
                 }
             }
         }
+*/
         
         //Building the call to exec()
         if (num_programs == 1 && !background)

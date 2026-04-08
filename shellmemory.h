@@ -32,7 +32,7 @@ typedef struct {
     int last_used; //timestamp of last access
 } Frame_Owners;
 
-extern Frame_Owner frame_owners[];
+extern Frame_Owners frame_owners[];
 
 //ready queue, implemented as a classic doubly linked list
 typedef struct queue {
